@@ -14,8 +14,13 @@
 #    limitations under the License.
 #
 
-FROM openjdk:21
-COPY . /usr/src/myapp
-WORKDIR /usr/src/myapp
-RUN ./mvnw clean package
-CMD ./mvnw cargo:run -P tomcat90
+FROM tomcat:9.0-jre17-temurin
+
+RUN rm -rf /usr/local/tomcat/webapps/* \
+ && useradd --system --uid 10001 appuser \
+ && chown -R appuser:appuser /usr/local/tomcat
+
+COPY --chown=appuser:appuser target/jpetstore.war /usr/local/tomcat/webapps/jpetstore.war
+
+USER appuser
+EXPOSE 8080
