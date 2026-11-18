@@ -1,120 +1,143 @@
-pipeline{
+pipeline {
     agent any
+
     tools {
         jdk 'jdk17'
         maven 'maven3'
     }
+
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        SCANNER_HOME = tool 'sonar-scanner'
+        IMAGE = 'samuelaka225/petshop'
     }
-    stages{
-        stage ('Cleaning Workspace'){
-            steps{
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Clean workspace') {
+            steps {
                 cleanWs()
             }
         }
-        stage ('checkout SCM') {
+
+        stage('Checkout') {
             steps {
-                git 'https://github.com/priyanshu-bhatt/DevSecOps-CI-CD-Pipeline.git'
+                git branch: 'master', url: 'https://github.com/samuelaka12/DevSecOps-CI-CD-Pipeline.git'
             }
         }
-        stage ('Compiling Maven Code') {
+
+        stage('Compile') {
             steps {
-                sh 'mvn clean compile'
+                sh 'mvn -B clean compile'
             }
         }
-        stage ('maven Test') {
+
+        stage('Unit tests') {
             steps {
-                sh 'mvn test'
+                sh 'mvn -B test'
             }
         }
-        stage("analysis using SonarQube "){
-            steps{
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Petshop \
-                    -Dsonar.java.binaries=. \
-                    -Dsonar.projectKey=Petshop '''
+
+        stage('SonarQube analysis') {
+            steps {
+                withSonarQubeEnv('sonarqube') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                          -Dsonar.projectKey=petshop \
+                          -Dsonar.projectName=Petshop \
+                          -Dsonar.sources=src/main \
+                          -Dsonar.java.binaries=target/classes
+                    '''
                 }
             }
         }
-        stage("SonarQube quality gate"){
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
+
+        stage('Package WAR') {
+            steps {
+                sh 'mvn -B package -DskipTests'
+            }
+        }
+
+        stage('OWASP Dependency-Check') {
             steps {
                 script {
-                  waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
+                    def dcHome = tool 'dependency-check'
+                    withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+                        sh """
+                            ${dcHome}/bin/dependency-check.sh \
+                              --project petshop \
+                              --scan target/*.war \
+                              --format XML --format HTML \
+                              --out . \
+                              --data /var/lib/jenkins/dependency-check-data \
+                              --nvdApiKey \$NVD_API_KEY
+                        """
+                    }
                 }
-           }
-        }
-        stage ('Building war file using Maven'){
-            steps{
-                sh 'mvn clean install -DskipTests=true'
+                dependencyCheckPublisher pattern: 'dependency-check-report.xml'
             }
         }
-        stage("OWASP Dependency Checking"){
-            steps{
-                dependencyCheck additionalArguments: '--scan ./ --format XML ', odcInstallation: 'dependency-check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage ('Building and pushing to docker hub'){
-            steps{
-                script{
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh "docker build -t priyanshu18/petshop:${BUILD_TAG} ."
-                        sh "docker push priyanshu18/petshop:${BUILD_TAG}"
-                   }
-                }
-            }
-        }
-        stage("Image Scanning using TRIVY"){
-            steps{
-                sh "trivy image priyanshu18/petshop:${BUILD_TAG} > trivy.txt"
-            }
-        }
-                stage('QA testing Stage'){
-            steps{
-                sh 'docker rm -f qacontainer'
-                sh 'docker run -d --name qacontainer -p 8080:8080 priyanshu18/petshop:latest'
-                sleep time: 60, unit: 'SECONDS'
-                retry(10){
-                
-                sh 'curl --silent http://3.110.124.24:8080/jpetstore/ | grep JPetStore'
-                }
-                //testing curl
-                
-            }
-            post {
-                failure {
-                    emailext attachLog: true,
-                    subject: "'${currentBuild.result}'",
-                    body: "Project: ${env.JOB_NAME}<br/>" +
-                        "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                        "URL: ${env.BUILD_URL}<br/>"+
-                        "<h1>QA Testing Failed</h1>",
-                    to: 'qateam@gmail.com',
-                    attachmentsPattern: 'trivy.txt'
-                }
-            }
-        }
-        stage("Trigger CD(Deployment)"){
-            steps{
-                  // Trigger the deployment pipeline and wait for it to complete
-                  build job: 'DevSecOps-CD', wait: true
-             }             
-         }
 
+        stage('Docker build') {
+            steps {
+                sh 'docker build -t $IMAGE:$BUILD_NUMBER -t $IMAGE:latest .'
+            }
+        }
+
+        stage('Trivy image scan') {
+            steps {
+                sh '''
+                    trivy image --no-progress \
+                      --severity HIGH,CRITICAL \
+                      --exit-code 0 \
+                      --format table \
+                      --output trivy-report.txt \
+                      $IMAGE:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DH_USER', passwordVariable: 'DH_TOKEN')]) {
+                    sh '''
+                        trap 'docker logout' EXIT
+                        echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+                        docker push $IMAGE:$BUILD_NUMBER
+                        docker push $IMAGE:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to k3s') {
+            steps {
+                withKubeConfig(credentialsId: 'k8s-petshop') {
+                    sh '''
+                        sed "s|IMAGE_TAG|$BUILD_NUMBER|" k8s/petshop.yaml | kubectl apply -f -
+                        kubectl rollout status deployment/petshop -n petshop --timeout=300s
+                    '''
+                }
+            }
+        }
     }
+
     post {
-     always {
-        emailext attachLog: true,
-            subject: "'${currentBuild.result}'",
-            body: "Project: ${env.JOB_NAME}<br/>" +
-                "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                "<h1> CI/CD Pipeline ran successfully"+
-                "URL: ${env.BUILD_URL}<br/>",
-            to: 'priyansh12t@gmail.com',  // Developer or manager Email
-            attachmentsPattern: 'trivy.txt'
-            
+        always {
+            archiveArtifacts artifacts: 'trivy-report.txt, dependency-check-report.html', allowEmptyArchive: true
+            sh 'docker image prune -f'
         }
     }
-
 }
